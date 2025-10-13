@@ -1,0 +1,21 @@
+bokeh
+cartopy
+colorlog
+click
+geoalchemy2
+geopandas
+jupyter
+python-kaleido
+mars_time @ git+https://github.com/marek-slipski/mars_time.git@rollback-py-req
+mcstools
+netCDF4
+numpy==1.23.5
+opencv-python
+pandas
+plotly
+psycopg2-binary  # For optimal performance, install the libpq PostgreSQL client library from source, and change this to `psycopg2`
+pyarrow
+scikit-learn
+scipy>=1.14
+sqlalchemy
+tqdm
