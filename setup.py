@@ -37,5 +37,5 @@ setup(name='mercap',
               'extract_climate_measurements = mercap.cli_funcs:extract_climate_measurements',
               ],
           },
-      project_urls={'Source': 'https://github.com/JPLMLIA/mercap'}
+      project_urls={'Source': 'https://github.jpl.nasa.gov/Martian-Climate/mercap'}
       )
