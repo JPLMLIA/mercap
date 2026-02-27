@@ -79,7 +79,7 @@ def copy_storm_files(filter_sheet_path, src_dir, dest_dir, ls_min=0, ls_max=120,
     
     # Copy files for each storm ID
     for row in filtered_df.itertuples(index=False):
-        filename = f"{row.storm_id}_MY{row.mars_year}_sol{int(row.sol):03d}_dbid{row.storm_db_id:05d}.png"
+        filename = f"{row.storm_id}_MY{int(row.mars_year)}_sol{int(row.sol):03d}_dbid{int(row.storm_db_id):05d}.png"
         
         # Find all matching source files
         matching_files = []
@@ -130,8 +130,8 @@ def copy_storm_files(filter_sheet_path, src_dir, dest_dir, ls_min=0, ls_max=120,
               help='Minimum number of profiles')
 @click.option('--area_max', type=float, default=1.6e6,
               help='Maximum area')
-@click.option('--pval_max', type=click.FloatRange(min=0, max=1), default=0.1,
-              help='Maximum p-value for dust opacity filtering. Use 1 to disable filtering.')
+@click.option('--pval_max', type=click.FloatRange(min=0, max=1), default=1,
+              help='Maximum p-value for dust opacity filtering. Use 1 to disable filtering. Note that storms w/out a pval (not enough data) will be excluded')
 @click.option('--pval_window_start', type=int, default=-1,
               help='Start sol for time series filtering')
 @click.option('--pval_window_end', type=int, default=2,

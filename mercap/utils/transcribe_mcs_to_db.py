@@ -3,27 +3,28 @@ import logging
 
 import pandas as pd
 import sqlalchemy
+from joblib import Parallel, delayed
 from shapely.geometry import Point
 from geoalchemy2 import Geometry
 from tqdm import tqdm
 import mars_time
 from sqlalchemy.exc import SQLAlchemyError
 
+from mercap.config import N_JOBS
 
-# Load MCS output (generated with something like the below:
-#    mysql_lun -e "SELECT dt, Date, UTC, Profile_lon, Profile_lat, l_s from profiles_2d where dt >= '2007-10-01 00:00:00' and dt < '2017-07-01 00:00:00';" > mcs_ddr1_matching_mdssd.txt
 
 logging.basicConfig(level=logging.INFO,
                     datefmt='%H:%M:%S',
                     format='%(asctime)s | %(lineno)d | %(levelname)-5s | %(module)-15s | %(message)s')
 
 @click.command()
-@click.option('--mcs_fpath', type=click.Path(exists=True), required=True, help='Filepath of MCS data dump (via mysql_lun).')
+@click.option('--mcs_fpath', type=click.Path(exists=True), required=True, help='Filepath of MCS data dump.')
 @click.option('--db_url', type=str, required=True, help='Database engine path to save PostGRES+PostGIS.')
 @click.option('--table_name', type=str, required=True, help='Database table name.')
+@click.option('--mcs_ddr1_latlon', type=click.Choice(["Profile", "Surf"]), default="Surf", help='MCS DDR1 lat/lon columns to use for profile locations.')
 @click.option('--write_conflict_behavior', type=click.Choice(['fail', 'replace', 'append']), default='fail', help='If database table already exists, specify what to do.')
 @click.option('--smoke_test', is_flag=True, help='Enable smoke test to debug by processing only the first 10000 profiles.')
-def cli(mcs_fpath, db_url, table_name, write_conflict_behavior, smoke_test):
+def cli(mcs_fpath, db_url, table_name, mcs_ddr1_latlon, write_conflict_behavior, smoke_test):
 
     logging.info('Reading MCS file: %s', mcs_fpath)
     nrows = 1000 if smoke_test else None
@@ -39,13 +40,15 @@ def cli(mcs_fpath, db_url, table_name, write_conflict_behavior, smoke_test):
                            'Dust_qual': 'dust_qual'}, inplace=True)
 
     logging.info('Adding Mars Datetime object')
-    # TODO: could be optimized
-    mars_dts = [mars_time.datetime_to_marstime(temp_dt) for temp_dt in tqdm(mcs_df.index.to_pydatetime(), desc='Converting datetime to Mars year/sol')]
+    mars_dts = Parallel(n_jobs=N_JOBS, verbose=1)(delayed(mars_time.datetime_to_marstime)(temp_dt) 
+                                                  for temp_dt in mcs_df.index.to_pydatetime())
     mcs_df['mars_year'] = [temp_dt.year for temp_dt in mars_dts]
     mcs_df['sol'] = [temp_dt.sol for temp_dt in mars_dts]
  
     logging.info('Converting lon/lat to Geometry type')
-    mcs_df['profile_loc'] = mcs_df.apply(lambda row: Point([row['Profile_lon'], row['Profile_lat']]).wkt, axis=1)
+    lon_col, lat_col = f'{mcs_ddr1_latlon}_lon', f'{mcs_ddr1_latlon}_lat'
+    mcs_df['profile_loc'] = [Point([lon, lat]).wkt for lon, lat in 
+                             tqdm(zip(mcs_df[lon_col], mcs_df[lat_col]), desc='Converting lon/lat to Geometry type')]
 
     logging.info('Exporting MCS info+geometry to database at: %s', db_url)
     column_types = {'profile_loc': Geometry('POINT')}

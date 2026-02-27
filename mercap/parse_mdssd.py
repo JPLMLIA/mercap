@@ -11,199 +11,34 @@ from sqlalchemy import String, Float, Integer, Boolean
 from shapely.geometry import Point, Polygon
 from geoalchemy2 import Geometry
 import geopandas as gpd
-from joblib import Parallel, delayed, parallel_config
 import shapely
 
-from mars_time import datetime_to_marstime, marstime_to_datetime, MarsTime
+from mars_time import marstime_to_datetime, MarsTime
 from mercap import config
 
 from mercap.utils.storm_data_proc import (read_mdssd_idl, get_polygon_properties, 
                                           get_binary_mask_polygon,
                                           write_storms_csv, write_storms_db,
                                           poly_fix_antimeridian_crossing, find_intersecting_storms,
-                                          load_marci_cumindex, calculate_marci_precise_timing)
+                                          load_marci_cumindex, apply_marci_timing_precision,
+                                          add_mars_sols, add_onset_end_and_merger_columns,
+                                          add_cumulative_sols_column, add_sol_by_sol_metrics)
 from mercap.utils.db_utils import sqlalchemy_engine_check
 from mercap.utils.util import get_logger
-
-from mcstools.util.time import sols_elapsed
-from mcstools.util.geom import haversine_dist
+from mercap.utils.viz_utils import plot_polygon_list
 
 
 # Rename columns to be clearer, avoid capital letters to match SQL convention
 COLUMNS_RENAME = {'MDGM': 'mdgm',
-                  'Year': 'mars_year', 
-                  'Ls': 'ls', 
+                  'Year': 'mars_year',
+                  'Year_orig': 'mars_year_orig',
+                  'Ls': 'ls',
+                  'Ls_orig': 'ls_orig',
                   'StormID': 'storm_id',
                   'SeqID': 'seq_id',
                   'Conflev': 'conflev'}
 
-
-def plot_polygon_list(polygons, save_fpath):
-
-    # Create a figure with subplots
-    fig, axs = plt.subplots(1, len(polygons), figsize=(len(polygons) * 5, 5))
-
-    # Convert the list of polygons to a GeoSeries
-    gseries = gpd.GeoSeries(polygons)
-
-    # If there is only one polygon, axs might not be an array, so we ensure it is
-    if not isinstance(axs, np.ndarray):
-        axs = np.array([axs])
-    
-    # Plot each polygon in its own subplot
-    for ai, ax in enumerate(axs):
-        gseries.loc[[ai]].plot(ax=ax, edgecolor='black', facecolor='red', alpha=0.5, aspect='equal')
-
-    # Adjust the subplots and save
-    plt.tight_layout()
-    fig.savefig(save_fpath)
-    plt.close(fig)
-    
-
-def add_mars_sols(df, n_jobs, verbose=True):
-    """Helper to augment a database of storms with MarsTime information"""
-
-    def calc_sol(dt):
-        return datetime_to_marstime(dt).sol
-
-    with parallel_config(n_jobs=n_jobs, verbose=verbose):
-        storm_sols = Parallel()(delayed(calc_sol)(row['dt']) for _, row in df.iterrows())
-    
-    df['sol'] = storm_sols
-
-    # Drop decimal of sol. Should be equivalent to simple `.astype(int)` cast since values here are all positive, 
-    # but keeping consistence with relative sol calcs
-    df['sol_int'] = np.floor(storm_sols).astype(int)  
-    
-    return df
-
-
-def add_onset_end_and_merger_columns(df: pd.DataFrame):
-    """
-    Storm IDs persist over multiple sols if storm continues.
-    Merged storms have '+' in name joining merged Storm IDs.
-    If row is first instance of Storm ID that isn't a merged storm, mark as onset.
-    If it's a merged storm, mark as merger onset
-    """
-    onset_merger_mapping = df.groupby("StormID")["dt"].min() # earliest time of storm
-    end_merger_mapping = df.groupby("StormID")["dt"].max()  # latest time of storm
-    df["storm_onset"] = df.apply(
-        lambda row: 1 if (
-            row["dt"] == onset_merger_mapping.loc[row["StormID"]]
-        ) and not (
-            "+" in row["StormID"]
-        ) else 0,
-        axis=1
-    )
-    df["merger_onset"] = df.apply(
-        lambda row: 1 if (
-            row["dt"] == onset_merger_mapping.loc[row["StormID"]]
-        ) and (
-            "+" in row["StormID"]
-        ) else 0,
-        axis=1
-    )
-    df["storm_end"] = df.apply(
-        lambda row: 1 if (
-            row["dt"] == end_merger_mapping.loc[row["StormID"]]
-        ) and not does_this_storm_merge(
-            df, row["StormID"]
-        ) else 0,
-        axis=1
-    )
-    return df
-
-
-def does_this_storm_merge(df, storm_id):
-    """Check if this storm merges."""
-    try:
-        storm_prefix, individual_ids = storm_id.split("_")
-    except ValueError as e:
-        # A few storms have IDs that I don't understand, ignore for now
-        return None
-    if "+" in individual_ids:
-        all_members_in_this_storm = individual_ids.split("+")  # get individual storm names
-    else:
-        all_members_in_this_storm = [individual_ids]  # only one storm
-    same_prefix = [x for x in df["StormID"].unique() if storm_prefix+"_" in x and x!=storm_id]  # all other storms with same prefix
-    future_merge = [
-        x for x in same_prefix if [
-            s for s in all_members_in_this_storm if s == x.split("_")[1]
-        ]
-    ]  # has same prefix and number shows up in merger
-    if len(future_merge) >0:
-        return 1
-    else:
-        return 0
-
-
-def add_cumulative_sols_column(df: pd.DataFrame):
-    """
-    For each storm member, determine how many sols have elapsed
-    since the start or merger of that storm.
-    """
-    first_time_of_storm = df.groupby("StormID")["dt"].min()
-    df["sols_since_onset/merger"] = df.apply(
-        lambda row: sols_elapsed(row["dt"], first_time_of_storm.loc[row["StormID"]]),
-        axis=1
-    ).astype(int)
-    return df
-
-
-def centroid_distance_traveled_for_single_storm(storm_df: pd.DataFrame):
-    """
-    For single storm with multiple members, determine how far the centroid moved
-    (per sol) from the previous member of the same storm
-    """
-    storm_df_sol_prior = storm_df.shift(1)
-    time_between_observations = storm_df.apply(lambda row: sols_elapsed(row["dt"], storm_df_sol_prior.loc[row.name, "dt"]), axis=1)
-    distance_traveled = storm_df.apply(
-        lambda row: haversine_dist(
-            row["lat"],
-            row["lon"], 
-            storm_df_sol_prior.loc[row.name, "lat"], 
-            storm_df_sol_prior.loc[row.name, "lon"], 
-            radius=3396.2
-        ), axis=1)/time_between_observations
-    return distance_traveled
-
-
-def area_change_for_single_storm(storm_df: pd.DataFrame):
-    """
-    For a single storm with multiple members, determine the absolute
-    change in area (per sol) since the last member
-    """
-    storm_df_sol_prior = storm_df.shift(1)
-    time_between_observations = storm_df.apply(lambda row: sols_elapsed(row["dt"], storm_df_sol_prior.loc[row.name, "dt"]), axis=1)
-    area_increase = (storm_df["area"]-storm_df_sol_prior["area"])/time_between_observations
-    return area_increase
-
-
-# TODO: Need to figure out how to handle values where date is <1 sol
-def add_sol_by_sol_metrics(df: pd.DataFrame):
-    """
-    Add all distance and area metrics for strom members across
-    the full storm DF.
-    """
-    distance_traveled_values, area_increase_values = [], []
-    for n, g in df.groupby("StormID"):
-
-        dist_traveled = centroid_distance_traveled_for_single_storm(g)
-        dist_traveled = dist_traveled.replace([np.inf, -np.inf], 0)
-        distance_traveled_values.append(dist_traveled)
-
-        temp_area_change = area_change_for_single_storm(g)
-        temp_area_change = temp_area_change.replace([np.inf, -np.inf], 0)
-        area_increase_values.append(temp_area_change)
-
-    distance_traveled_values = pd.concat(distance_traveled_values)
-    area_increase_values = pd.concat(area_increase_values)
-    df["centroid_distance_per_sol"] = distance_traveled_values
-    df["area_increase_per_sol"] = area_increase_values
-    df["fractional_area_increase_per_sol"] = df["area"]/(df["area"] - df["area_increase_per_sol"])
-    r_eff = np.sqrt((df["area"] - df["area_increase_per_sol"])/np.pi)
-    df["centroid_distance_per_sol_reff"] = df["centroid_distance_per_sol"]/r_eff
-    return df
+ERODE_DILATE_DURING_POLYGON_EXTRACTION = True
 
 
 @click.command()
@@ -242,49 +77,50 @@ def cli(mdssd_head_dir, poly_extraction_epsilon, mdgm_arr_size, mdgm_offset,
     ######################################
     # If desired, calculate precise Ls values using MARCI data and replace the Ls column
     if config.IMPROVE_MARCI_TIMING_PRECISION:
-        logger.info('Adding precise Ls/datetime values using MARCI data')
         cumindex_df = load_marci_cumindex(marci_cumindex_fpath)
-        dt_precise, ls_precise, orbit_nums = calculate_marci_precise_timing(mdssd_df, marci_lists_dir, cumindex_df)
-
-        # Add timing info and post-process
-        mdssd_df['dt'] = dt_precise
-
-        ls_precise = np.array(ls_precise)
-        mdssd_df['orbit_num'] = np.array(orbit_nums).astype(int)  # Convert to int for DB compatibility
-        
-        # Error check to make sure the Ls values are not very different. 
-        # Looking for large values that are not ~360 deg apart (where there was wrapping)
-        ls_change = np.abs(mdssd_df['Ls'].to_numpy() - ls_precise)
-        if np.any(np.logical_and(ls_change > 1, ls_change < 359)):
-            logger.warning('Large difference between Ls and ls_precise.')
-
-        rows_to_increment_year = (mdssd_df['Ls'] > 355) & (ls_precise < 5)  # Ls was high, now it's low
-        rows_to_decrement_year = (mdssd_df['Ls'] < 5) & (ls_precise > 355)  # Ls was low now it's high
-        mdssd_df.loc[rows_to_increment_year, 'Year'] += 1
-        mdssd_df.loc[rows_to_decrement_year, 'Year'] -= 1
-        mdssd_df['Ls_orig'] = mdssd_df['Ls']  # Store original Ls values
-        mdssd_df['Ls'] = ls_precise  # Overwrite Ls
-
-        logger.info(f'Incremented {np.sum(rows_to_increment_year)} years and decremented {np.sum(rows_to_decrement_year)} years.')
-        logger.info(f'Ls values overwritten with precise values from MARCI swath metadata. Datetime (of swath start) also added.')
+        mdssd_df = apply_marci_timing_precision(mdssd_df, marci_lists_dir, cumindex_df, n_jobs,
+                                                mdgm_col='MDGM', mars_year_col='Year',
+                                                ls_col='Ls', dt_col='dt', logger=logger)
+    else:
+        # Create placeholder if not using MARCI timing precision
+        mdssd_df['orbit_num'] = -1
         
     ######################################
-    # Add datetime and Mars time information
-    logger.info('Adding time information to storms (Earth dt and Mars sol)')
-    mdssd_df = add_mars_sols(mdssd_df, n_jobs)
+    # Add Mars time information
+
+    logger.info('Adding Mars sols from datetime')
+    # Store original sol if it exists
+    if 'sol' in mdssd_df.columns:
+        mdssd_df.rename(columns={'sol': 'sol_orig'}, inplace=True)
+    mdssd_df = add_mars_sols(mdssd_df, n_jobs, dt_col='dt')
+
     logger.info('Adding onset, end, merger, and cumulative sols timing information to storms')
-    mdssd_df = add_onset_end_and_merger_columns(mdssd_df)
-    mdssd_df = add_cumulative_sols_column(mdssd_df)
+    mdssd_df = add_onset_end_and_merger_columns(mdssd_df, dt_col='dt')
+    mdssd_df = add_cumulative_sols_column(mdssd_df, dt_col='dt')
+
     logger.info('Adding distance and area metrics to storms')
-    mdssd_df = add_sol_by_sol_metrics(mdssd_df)
+    mdssd_df = add_sol_by_sol_metrics(mdssd_df, dt_col='dt')
+    
+    ######################################
+    # Reorder columns to place timing columns next to each other near start of df (before column renaming)
+    target_cols = ['Year_orig', 'Year', 'Ls', 'Ls_orig', 'sol', 'sol_orig', 'sol_int']
+    existing_target_cols = [col for col in target_cols if col in mdssd_df.columns]
+    
+    if existing_target_cols:
+        cols = list(mdssd_df.columns)
+        cols_reordered = [c for c in cols if c not in existing_target_cols]
+        for col in reversed(existing_target_cols):
+            cols_reordered.insert(2, col)
+        mdssd_df = mdssd_df[cols_reordered]
 
     ###################################
     logger.info('Adding geometry information')
     storm_center_points = mdssd_df.apply(lambda row: Point([row['lon'], row['lat']]), axis=1)
     mdssd_df['storm_center_point'] = [pt.wkt for pt in storm_center_points]
 
-    # Initialize the storm polygon series
+    # Initialize the storm polygon series and geometry validation flag
     mdssd_df['storm_polygon'] = pd.Series([''] * len(mdssd_df))
+    mdssd_df['geometry_valid'] = pd.Series([None] * len(mdssd_df))
 
     # Initialize lists for error tracking
     polygon_error_cases = []
@@ -346,11 +182,15 @@ def cli(mdssd_head_dir, poly_extraction_epsilon, mdgm_arr_size, mdgm_offset,
             binary_mask = np.zeros(mdgm_arr_size, dtype=bool)
             binary_mask[mdgm_arr_size[0] - idl_obj.roiy[0] - 1, idl_obj.roix[0] - 1] = True  # Convert x,y to row,col and move origin to TL
 
-            storm_polygon = get_binary_mask_polygon(binary_mask, (0, 0), poly_extraction_epsilon, erode_dilate=True, logger=logger)
+            storm_polygon = get_binary_mask_polygon(binary_mask, (0, 0), poly_extraction_epsilon, 
+                                                    erode_dilate=ERODE_DILATE_DURING_POLYGON_EXTRACTION, logger=logger)
+
             if storm_polygon is None:
                 logger.error(f'Storm found with no positive pixels. MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}.')
                 lost_mask_error_cases.append(f'MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}')
                 continue
+            
+            # Converting from OpenCV coordinates (0, 0) at top left, and in x, y
             storm_polygon[:, 1] = mdgm_offset[1] + storm_polygon[:, 1] * -1
             storm_polygon[:, 0] += mdgm_offset[0]
 
@@ -368,6 +208,19 @@ def cli(mdssd_head_dir, poly_extraction_epsilon, mdgm_arr_size, mdgm_offset,
             storm_polygon_shapely = Polygon(0.1 * storm_polygon)
             # Deal with antimeridian splits. Long values > 180 need to have 360 deg subtracted to wrap
             storm_polygon_shapely = poly_fix_antimeridian_crossing(storm_polygon_shapely)
+
+            # Detailed geometry validation
+            is_valid = storm_polygon_shapely.is_valid
+            is_simple = storm_polygon_shapely.is_simple
+            
+            if not is_valid or not is_simple:
+                validity_reason = shapely.validation.explain_validity(storm_polygon_shapely)
+                logger.error(f'Shape abnormality on MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}. '
+                           f'is_valid: {is_valid}, is_simple: {is_simple}, reason: {validity_reason}')
+            
+            # Additional geometry checks
+            if is_valid and storm_polygon_shapely.has_z:
+                logger.warning(f'Polygon has Z coordinates (unexpected) for MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}.')
 
             object_polygons.append(storm_polygon_shapely)
             storm_polygon_wkt = shapely.wkt.dumps(storm_polygon_shapely, trim=True, rounding_precision=5)  # Reduceds artificial ballooning of decimal places
@@ -408,15 +261,15 @@ def cli(mdssd_head_dir, poly_extraction_epsilon, mdgm_arr_size, mdgm_offset,
             elif np.sum(row_sel_criteria) == 0:
                 logger.error(f'Found no matching rows for MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}.')
                 no_match_error_cases.append(f'MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}')
-            if not storm_polygon_shapely.is_simple or not storm_polygon_shapely.is_valid:
-                logger.error(f'Shape abnormality on MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}.')
+            if not is_valid or not is_simple:
                 shape_abnormalities.append(f'MGDM: {mdgm}, StormID: {storm_id}, SeqID: {obj_seq_id}')
                 
             mdssd_df.loc[row_sel_criteria, 'storm_polygon'] = storm_polygon_wkt
+            mdssd_df.loc[row_sel_criteria, 'geometry_valid'] = is_valid and is_simple
             storm_count += 1
             
-        storm_fig_save_fpath = fpath.parent / Path(fpath.stem + '_polygons.png')
-        plot_polygon_list(object_polygons, storm_fig_save_fpath)
+        polygons_fig_save_fpath = fpath.parent / Path(fpath.stem + '_polygons.png')
+        plot_polygon_list(object_polygons, polygons_fig_save_fpath)
 
     logger.info(f'Polygon errors: {len(polygon_error_cases)}:\n{polygon_error_cases}\n\n')
     logger.info(f'Multi match errors: {len(multi_match_error_cases)}:\n{multi_match_error_cases}\n\n')
@@ -474,10 +327,15 @@ def cli(mdssd_head_dir, poly_extraction_epsilon, mdgm_arr_size, mdgm_offset,
                         'intersecting_storm_sols': String,
                         'storm_center_point': Geometry('POINT'),
                         'storm_polygon': Geometry('MULTIPOLYGON'),
-                    }
-        if 'Ls_orig' in mdssd_df.columns:
-            column_types['Ls_orig'] = Float
+                        'geometry_valid': Boolean}
+        if 'mars_year_orig' in mdssd_df.columns:
+            column_types['mars_year_orig'] = Integer
+        if 'ls_orig' in mdssd_df.columns:
+            column_types['ls_orig'] = Float
+        if 'sol_orig' in mdssd_df.columns:
+            column_types['sol_orig'] = Float
 
+        # XXX: Occasionally, this will hang. If it does, restart. The DB insertion for 10k storms should only take ~10s.
         write_storms_db(mdssd_df, 'mdssd', db_url, column_types, db_existing_behavior='replace')
 
 if __name__ == '__main__':

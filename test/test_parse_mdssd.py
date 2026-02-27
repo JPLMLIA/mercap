@@ -1,7 +1,11 @@
 import pytest
 import numpy as np
 
-from mercap.parse_mdssd import get_binary_mask_polygon
+from mercap.utils.storm_data_proc import get_binary_mask_polygon
+
+
+# Run by cd'ing to test directory and running:
+# pytest .
 
 
 # Define some simple diamond polygons in row/col coordinates
@@ -37,13 +41,11 @@ def test_get_binary_mask_polygon_errors(binary_mask, xy_offset, poly_extraction_
         get_binary_mask_polygon(binary_mask, xy_offset, poly_extraction_epsilon)
 
 
-@pytest.mark.parametrize("binary_mask, xy_offset, poly_extraction_epsilon, expected", [
-    (ONE_POLYGON_IMAGE, (0, 0), 0.001, contour_1), 
-    (SPLIT_POLYGON_IMAGE, (0, 0), 0.001, contour_broken),
-    ])
-def test_get_binary_mask_polygon(binary_mask, xy_offset, poly_extraction_epsilon, expected):
-    result = get_binary_mask_polygon(binary_mask, xy_offset, poly_extraction_epsilon)
-    #import ipdb; ipdb.set_trace()
+@pytest.mark.parametrize("binary_mask, xy_offset, poly_extraction_epsilon, erode_dilate, expected", 
+                         [(ONE_POLYGON_IMAGE, (0, 0), 0.001, False, contour_1), 
+                          (SPLIT_POLYGON_IMAGE, (0, 0), 0.001, False, contour_broken)])
+def test_get_binary_mask_polygon(binary_mask, xy_offset, poly_extraction_epsilon, erode_dilate, expected):
+    result = get_binary_mask_polygon(binary_mask, xy_offset, poly_extraction_epsilon, erode_dilate)
 
     # Convert from x/y (with 0,0 at TL corner) to row/col
     result[:, [1, 0]] = result[:, [0, 1]]

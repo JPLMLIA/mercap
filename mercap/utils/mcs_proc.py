@@ -37,7 +37,8 @@ def filter_missing_cols(orig_targets, column_name='L2_fname'):
 # TODO: convert properties from tuple here to configurable list
 def pull_MCS_target_data(mcs_fpath, prof_num, 
                          mcs_ddr1_keys=('Date', 'UTC', 'Profile_lat', 'Profile_lon', 'L_s', 'Dust_column', 'H2Oice_column', 
-                                        'Obs_qual', 'Rqual', 'P_qual', 'T_qual', 'Dust_qual', 'H2Oice_qual', 'surf_qual'),
+                                        'Obs_qual', 'Rqual', 'P_qual', 'T_qual', 'Dust_qual', 'H2Oice_qual', 'surf_qual',
+                                        'Surf_lat', 'Surf_lon'),
                          mcs_ddr2_keys=('Alt', 'T', 'Pres', 'Dust', 'H2Oice', 'level'), 
                          level_group_size=None, is_seq=None, storm_area=None, target_ind=None, great_circ_dist=None,
                          lat_lon_diff=None, target_type=None, mdad_ind=None,
@@ -91,6 +92,8 @@ def pull_MCS_target_data(mcs_fpath, prof_num,
     # TODO: consider moving to config
     targ_data = targ_data.astype({'Profile_lat':'float32',
                                   'Profile_lon':'float32',
+                                  'Surf_lat':'float32',
+                                  'Surf_lon':'float32',
                                   'L_s': 'float32',
                                   'great_circ_dist': 'float32',
                                   'Dust_column':'float32',
@@ -166,6 +169,8 @@ def select_closest_target(profile_matches, prof_key, ddr1_props=None):
                      'great_circ_dist': None,
                      'Profile_lat': None,
                      'Profile_lon': None, 
+                     'Surf_lat': None,
+                     'Surf_lon': None, 
                      'lat_diff': None, 
                      'lon_diff': None}
 
@@ -191,6 +196,8 @@ def select_closest_target(profile_matches, prof_key, ddr1_props=None):
                       'great_circ_dist': profile_matches['great_circ_dist'][good_ind],
                       'Profile_lat': profile_matches['Profile_lat'][good_ind],
                       'Profile_lon': profile_matches['Profile_lon'][good_ind], 
+                      'Surf_lat': profile_matches['Surf_lat'][good_ind],
+                      'Surf_lon': profile_matches['Surf_lon'][good_ind], 
                       'lat_diff': profile_matches['lat_diff'][good_ind], 
                       'lon_diff': profile_matches['lon_diff'][good_ind]}
     

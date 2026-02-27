@@ -6,7 +6,7 @@ import numpy as np
 import datetime
 
 from mars_time import marstime_to_datetime, datetime_to_marstime, MarsTime, MarsTimeDelta
-from mars_time.constants import seconds_per_sol
+from mars_time.constants import seconds_per_sol, sols_per_year
 from mcstools import L2Loader
 from mercap.config import INT_SOLS_PER_MY, DROP_INVALID_DDR1
 
@@ -142,6 +142,32 @@ def add_rel_sol_columns(df, storm_dt, zero_out_year=False, day_or_night_rounding
     We want to work in MarsTime here so that we have the option to drop the MY difference 
     (and get only the seasonal difference). This is valuable for control matching
     """
+    
+    # Ensure the 'dt' column is timezone-aware and in UTC
+    if df['dt'].dt.tz is None:
+        # Assume naive datetime is in UTC (matching MCS data)
+        df['dt'] = df['dt'].dt.tz_localize('UTC')
+    else:
+        df['dt'] = df['dt'].dt.tz_convert('UTC')
+        
+    # Compute the time difference in seconds as a numpy array/Series
+    time_diff_sec = (df['dt'] - storm_dt).dt.total_seconds()
+    sol_diff = time_diff_sec / seconds_per_sol
+
+    # XXX: Using the mod and looking for min(abs(diff)) works as long as we assume a small window (here, +/- 20 sols)
+    if zero_out_year:
+        # Compute sol differences to within a year, but not adjusted for year crossings
+        sol_diff_unadjusted = (sol_diff % sols_per_year).to_numpy()[:, np.newaxis]
+        sol_diff_pos_neg = np.hstack([sol_diff_unadjusted, sol_diff_unadjusted - sols_per_year, sol_diff_unadjusted + sols_per_year])
+
+        # Identify whether the nearest year crossing is closer storm_dt, and use it if it is
+        nearest_index = np.argmin(np.abs(sol_diff_pos_neg), axis=1)
+        sol_diff = sol_diff_pos_neg[np.arange(len(nearest_index)), nearest_index]
+
+    df['rel_sol'] = sol_diff
+    
+    '''
+    # Original approach using MarsTimeDelta
     storm_mt = datetime_to_marstime(storm_dt)
 
     # Loop over rows, calculate the MarsTime object for each row, subtract the storm's time to get a MarsTimeDelta
@@ -149,10 +175,20 @@ def add_rel_sol_columns(df, storm_dt, zero_out_year=False, day_or_night_rounding
 
     # For controls, we will likely want to discard the difference in Mars years. (Effectively, "mod" by one Mars Year)
     if zero_out_year:
-        mt_diff = [MarsTimeDelta(sol=temp_mt.sol) for temp_mt in mt_diff]
-        
-    # Calculate the number of sols between each profile and the storm
-    df['rel_sol'] = [temp_mt_diff.sols for temp_mt_diff in mt_diff]
+        rel_sol_list = []
+        for temp_mt_diff in mt_diff:
+            # Won't know if we want year prior or year after, so test both and take the min
+            # NOTE: Working with solar longitude could be slightly more accurate, but involves an optimization step, which is computationally expensive
+            sol_diffs = [MarsTimeDelta(year=-1, sol=temp_mt_diff.sol).sols, 
+                         MarsTimeDelta(year=0, sol=temp_mt_diff.sol).sols]
+            min_idx = np.argmin(np.abs(sol_diffs))
+            sol_diff = sol_diffs[min_idx]
+
+            rel_sol_list.append(sol_diff)
+    else:
+        rel_sol_list = [temp_mt_diff.sols for temp_mt_diff in mt_diff]
+    df['rel_sol'] = rel_sol_list
+    '''
     
     if day_or_night_rounding:
         # TODO: could rename the column to something like `rel_sol_discretized` since we no longer are using integers
@@ -165,7 +201,7 @@ def add_rel_sol_columns(df, storm_dt, zero_out_year=False, day_or_night_rounding
     return df
 
 
-def find_ddr1_storm_profile_matches(connection, storm_db_id, storm_dt, time_window_bounds, ltst_start=None, ltst_end=None, good_obs_quals=None, verbose=False):
+def find_ddr1_storm_profile_matches(connection, storm_db_id, storm_dt, time_window_bounds, data_source, ltst_start=None, ltst_end=None, good_obs_quals=None, data_source_date_start=None, data_source_date_end=None, verbose=False):
     """Identify profiles intersecting with storm in space and time.""" 
     # Setup some optional filters for the search statement
 
@@ -184,19 +220,26 @@ def find_ddr1_storm_profile_matches(connection, storm_db_id, storm_dt, time_wind
     time_filter = 'AND mcs.dt BETWEEN :start_dt AND :end_dt '
     bind_params_update = {'start_dt': start_dt, 'end_dt': end_dt}
 
+    # Add data source date range filter
+    data_source_date_filter = ''
+    if data_source_date_start and data_source_date_end:
+        data_source_date_filter = 'AND mcs.dt BETWEEN :data_source_date_start AND :data_source_date_end '
+        bind_params_update['data_source_date_start'] = data_source_date_start
+        bind_params_update['data_source_date_end'] = data_source_date_end
+
     # Add local true solar time filter and observation quality filter
     ltst_start_filter = f'AND mcs.ltst >= {ltst_start} ' if ltst_start else ''
     ltst_end_filter = f'AND mcs.ltst < {ltst_end} ' if ltst_end else ''
     obs_qual_filter = f'AND mcs.obs_qual IN {good_obs_quals} ' if good_obs_quals else ''
 
-    # TODO: probably should convert this to use SQLAlchemy's more-pythonic ORM syntax
     # Construct SQL statement
     text_statement = text(f'''
                           SELECT mcs.* 
                           FROM mcs_profiles_2d mcs 
-                          JOIN mdssd_table mdssd ON ST_Within(mcs.profile_loc, mdssd.storm_polygon) 
-                          WHERE mdssd.id = :storm_db_id
+                          JOIN {data_source}_table storm ON ST_Within(mcs.profile_loc, storm.storm_polygon) 
+                          WHERE storm.id = :storm_db_id
                           {time_filter}
+                          {data_source_date_filter}
                           {ltst_start_filter}
                           {ltst_end_filter}
                           {obs_qual_filter}
@@ -214,7 +257,7 @@ def find_ddr1_storm_profile_matches(connection, storm_db_id, storm_dt, time_wind
     return storm_profile_hits
 
 
-def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, ls_tolerance=None, time_window_bounds=None, ltst_start=None, ltst_end=None, good_obs_quals=None, control_exclusions_dict=None, verbose=False):
+def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, data_source, ls_tolerance=None, time_window_bounds=None, ltst_start=None, ltst_end=None, good_obs_quals=None, control_exclusions_dict=None, data_source_date_start=None, data_source_date_end=None, verbose=False):
     """Identify profiles that would serve as controls for a known storm.
     
     Use either `ls_tolerance` (a float) or `time_window_bounds` (a tuple of ints representing sols) to specify the desired time window.
@@ -225,10 +268,10 @@ def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, ls_tole
         Database connection
     storm_db_id : int
         Database ID of the storm to find controls for
-    storm_MY : int
-        Mars year of the storm of interest. Control profiles will never come from the same Mars year as the storm of interest.
-    storm_sol : float
-        Sol (float) for the storm of interest
+    storm_dt : int
+        Datetime of the storm of interest. Control profiles will never come from the same Mars year as the storm of interest.
+    data_source : str
+        Data source name (mdssd or mdad)
     ls_tolerance : float, optional
         Solar longitude tolerance for matching controls. If used, must be positive. 
         We only care about seasonal changes here, so the Mars Years component of the difference is dropped. 
@@ -246,6 +289,10 @@ def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, ls_tole
     control_exclusions_dict : dict, optional
         Dictionary containing Mars years as keys and list of integer sols as values to exclude from the search.
         These should correspond to known storm overlaps/confounders from other Mars years that need to be removed from the search results.
+    data_source_date_start : datetime, optional
+        Earliest allowed date for data source
+    data_source_date_end : datetime, optional
+        Latest allowed date for data source
     verbose : bool, optional
         Whether to print verbose output
         
@@ -304,6 +351,14 @@ def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, ls_tole
     obs_qual_filter = f'AND mcs.obs_qual IN {good_obs_quals} ' if good_obs_quals else ''
 
     #########################################################
+    # Add data source date range filter
+    data_source_date_filter = ''
+    if data_source_date_start and data_source_date_end:
+        data_source_date_filter = 'AND mcs.dt BETWEEN :data_source_date_start AND :data_source_date_end '
+        bind_params['data_source_date_start'] = data_source_date_start
+        bind_params['data_source_date_end'] = data_source_date_end
+
+    #########################################################
     # Add storm confounder exclusion criteria. This excludes profiles that overlapped with OTHER storms
     exclusion_filter_list = []
     if control_exclusions_dict:
@@ -317,12 +372,13 @@ def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, ls_tole
     #########################################################
     # Construct SQL statement
     text_statement = text(f'''
-                          SELECT mcs.*, mdssd.mars_year AS storm_mars_year, mdssd.ls AS storm_ls, mdssd.storm_id, mdssd.seq_id AS storm_seq_id
+                          SELECT mcs.*, storm.mars_year AS storm_mars_year, storm.ls AS storm_ls, storm.storm_id, storm.seq_id AS storm_seq_id
                           FROM mcs_profiles_2d AS mcs
-                          JOIN mdssd_table AS mdssd ON ST_Within(mcs.profile_loc, mdssd.storm_polygon)
-                          WHERE mdssd.id = :storm_db_id
+                          JOIN {data_source}_table AS storm ON ST_Within(mcs.profile_loc, storm.storm_polygon)
+                          WHERE storm.id = :storm_db_id
                           {time_filter}
                           {season_filter}
+                          {data_source_date_filter}
                           {ltst_start_filter}
                           {ltst_end_filter}
                           {obs_qual_filter}
@@ -337,6 +393,54 @@ def find_ddr1_control_profile_matches(connection, storm_db_id, storm_dt, ls_tole
         logging.info(str(control_profile_hits.info()))
 
     return control_profile_hits
+
+
+def load_ddr1_from_profile_matches(profile_hits, verbose=False):
+    """Load DDR1 data for a selected group of profiles identified with
+    ``find_ddr1_storm_profile_matches`` or ``find_ddr1_control_profile_matches``.
+
+    This is the DDR1-only variant of ``load_ddr2_from_profile_matches``.
+    It loads profile-level metadata (column-integrated quantities, coordinates,
+    quality flags, etc.) from MCS flat files without loading per-level DDR2 data.
+
+    Parameters
+    ----------
+    profile_hits : pd.DataFrame
+        Output of a profile query.  Required columns: ``["dt", "Date", "UTC",
+        "mars_year", "sol", "rel_sol", "rel_sol_int"]``.
+    verbose : bool
+        Whether to print extra info to command line.
+
+    Returns
+    -------
+    pd.DataFrame
+        Matched DDR1 data with one row per profile.
+    """
+    if 'rel_sol' not in profile_hits.columns or 'rel_sol_int' not in profile_hits.columns:
+        raise RuntimeError(
+            'profile_hits must contain `rel_sol` and `rel_sol_int`. '
+            'Try applying utils.profile_search.add_rel_sol_columns() first.')
+
+    l2 = L2Loader()
+
+    ddr1 = l2.load_from_datetimes("DDR1", profile_hits['dt'], add_cols=['dt'],
+                                  verbose=verbose)
+
+    if DROP_INVALID_DDR1:
+        ddr1 = ddr1.loc[ddr1['1'] == 0].drop(columns='1')
+    else:
+        ddr1 = ddr1.drop(columns='1')
+
+    matched_ddr1 = pd.merge(
+        ddr1,
+        profile_hits[['Date', 'UTC', 'mars_year', 'sol', 'rel_sol', 'rel_sol_int']],
+        on=['Date', 'UTC'], how='inner')
+
+    if verbose:
+        logging.info('Loaded DDR1 data for %d profiles',
+                     matched_ddr1['Profile_identifier'].nunique())
+
+    return matched_ddr1
 
 
 def load_ddr2_from_profile_matches(profile_hits, min_dust_permitted=None, verbose=False):

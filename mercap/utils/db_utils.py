@@ -70,15 +70,15 @@ def get_database_table_info(connection, verbose=False):
     }
     
     if verbose:
-        logging.info(f"Found {len(table_names)} tables in database")
+        logging.info(f"\n\nFound {len(table_names)} tables in database")
         for table_name in table_names:
             logging.info(f"  {table_name}")
 
-        logging.info("Table row counts for tables of interest:")
+        logging.info("\n\nTable row counts for tables of interest:")
         for table, count in count_data.items():
             logging.info(f"  {table}:\t\t{count:12,} rows")
 
-        logging.info("Table column names for tables of interest:")
+        logging.info("\n\nTable column names for tables of interest:")
         for table, columns in column_data.items():
             logging.info(f"  {table}:{columns.to_string(index=False)}")
     

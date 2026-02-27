@@ -51,7 +51,7 @@ def filter_storms(df, ls_min, ls_max, lat_min, lat_max,
                      (df['conflev'] >= conflev_min) &                       # Confidence level (likely want >= 2 or 3)
                      (df['storm_len_in_sols'] <= storm_len_max) &             # Total storm length. 1 or 2 sols for "local" storms
                      (df['n_storm_profiles_sol_of'] >= n_profiles_min) &       # Number of profiles on the sol the member was observed
-                     (df['area'] <= area_max)]                         # Area limit (<1.6e6 km^2 for "local" storms)
+                     (df['area'] <= area_max)]                         # Area limit (<=1.6e6 km^2 for "local" storms)
 
     # Timeseries metadata filtering - only if pval_max is not None
     if pval_max is not None:
@@ -61,7 +61,7 @@ def filter_storms(df, ls_min, ls_max, lat_min, lat_max,
 
     # Filter storms to those that have an onset and end, and are not a sequence
     if storm_lifecycle_filter:
-        storms_with_onset = df.loc[df["storm_onset"]==1, "storm_id"].to_list()  # Need to search in orig df in case some instances of a storm got filtered
+        storms_with_onset = df.loc[df["storm_onset"]==1, "storm_id"].to_list()
         storms_with_end = df.loc[df["storm_end"]==1, "storm_id"].to_list()
         filtered_df = filtered_df[(filtered_df["storm_id"].isin(storms_with_onset) & 
                                    filtered_df["storm_id"].isin(storms_with_end) & 
